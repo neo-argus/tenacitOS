@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
+import { isAuthenticatedRequest } from "@/lib/auth";
 
 // Routes that never require authentication
 const PUBLIC_ROUTES = new Set(["/login"]);
@@ -7,12 +8,7 @@ const PUBLIC_ROUTES = new Set(["/login"]);
 // API routes that are always public (auth endpoints + health check)
 const PUBLIC_API_PREFIXES = ["/api/auth/", "/api/health"];
 
-function isAuthenticated(request: NextRequest): boolean {
-  const authCookie = request.cookies.get("mc_auth");
-  return !!(authCookie && authCookie.value === process.env.AUTH_SECRET);
-}
-
-export function middleware(request: NextRequest) {
+export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   // Always allow public pages (login)
@@ -26,7 +22,7 @@ export function middleware(request: NextRequest) {
   }
 
   // Check authentication
-  if (!isAuthenticated(request)) {
+  if (!(await isAuthenticatedRequest(request))) {
     // For API routes: return 401 JSON (not a redirect)
     if (pathname.startsWith("/api/")) {
       return NextResponse.json(

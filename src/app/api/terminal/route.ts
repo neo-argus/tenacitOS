@@ -2,18 +2,18 @@
  * Secure Browser Terminal API
  * POST /api/terminal
  * Body: { command }
- * 
- * Security: strict command allowlist pattern matching
- * Only allows safe read-only and status commands
+ *
+ * Security: no shell, no pipes/redirection, base-command allowlist,
+ * and filesystem reads limited to explicit safe prefixes.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
+import path from 'path';
+import { OPENCLAW_DIR, OPENCLAW_WORKSPACE } from '@/lib/paths';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
-// Allowlist of allowed base commands (first word of command)
-// NOTE: env, curl, wget intentionally excluded to prevent secret exfiltration and arbitrary downloads
 const ALLOWED_BASE_COMMANDS = new Set([
   'ls', 'cat', 'head', 'tail', 'grep', 'wc', 'find', 'stat', 'du', 'df',
   'ps', 'pgrep', 'pidof', 'top', 'htop',
@@ -27,87 +27,102 @@ const ALLOWED_BASE_COMMANDS = new Set([
   'locate',
 ]);
 
-// Explicitly blocked patterns
-const BLOCKED_PATTERNS: RegExp[] = [
-  /\brm\s/,
-  /\brmdir\s/,
-  /\bsudo\b/,
-  /\bchmod\b/,
-  /\bchown\b/,
-  /\bpasswd\b/,
-  /\bmkfs\b/,
-  /\bdd\s+(if|of)=/,
-  /\bformat\b/,
-  /\bshutdown\b/,
-  /\breboot\b/,
-  /\bkill\b/,
-  /\bpkill\b/,
-  /\benv\b/,        // would expose env vars (ADMIN_PASSWORD, AUTH_SECRET)
-  /\bprintenv\b/,   // same as env
-  /\bcurl\b/,       // arbitrary HTTP requests / data exfiltration
-  /\bwget\b/,       // arbitrary downloads
-  /\bnode\b/,       // arbitrary JS execution
-  /\bnpm\b/,        // can run arbitrary scripts
-  /\bpython3?\b/,   // arbitrary code execution
-  /`[^`]*`/,        // command substitution
-  /\$\(/,           // command substitution
-  />{1,2}\s*[^|&]/,  // output redirect (not pipe)
-  /eval\s/,
-  /exec\s/,
-  /\bsource\b/,
-  /\bmount\b/,
-  /\bumount\b/,
+const SHELL_META = /[|&;<>()`$\\]/;
+const BLOCKED_ARGS: RegExp[] = [
+  /^-exec$/,
+  /^-delete$/,
+  /^--output(?:=.*)?$/,
+  /^--config(?:=.*)?$/,
+  /^https?:\/\//i,
 ];
 
-function isCommandAllowed(cmd: string): boolean {
-  const trimmed = cmd.trim();
+const SAFE_PATH_PREFIXES = [
+  `${path.resolve(OPENCLAW_WORKSPACE)}${path.sep}`,
+  `${path.resolve(path.join(OPENCLAW_DIR, 'logs'))}${path.sep}`,
+  `${path.resolve('/var/log')}${path.sep}`,
+  `${path.resolve('/tmp/openclaw')}${path.sep}`,
+];
 
-  // Check blocked patterns first
-  for (const pattern of BLOCKED_PATTERNS) {
-    if (pattern.test(trimmed)) return false;
+function tokenize(command: string): string[] {
+  return command.trim().split(/\s+/).filter(Boolean);
+}
+
+function resolveIfPath(arg: string): string | null {
+  if (!arg.startsWith('/') && !arg.startsWith('./') && !arg.startsWith('../') && !arg.includes('/')) {
+    return null;
+  }
+  return path.resolve(arg);
+}
+
+function isAllowedPath(resolvedPath: string): boolean {
+  return SAFE_PATH_PREFIXES.some((prefix) => resolvedPath === prefix.slice(0, -1) || resolvedPath.startsWith(prefix));
+}
+
+function validateCommand(command: string): { ok: true; bin: string; args: string[] } | { ok: false; reason: string } {
+  const trimmed = command.trim();
+  if (!trimmed) return { ok: false, reason: 'No command provided' };
+  if (trimmed.length > 500) return { ok: false, reason: 'Command too long' };
+  if (SHELL_META.test(trimmed)) return { ok: false, reason: 'Shell operators are not allowed' };
+
+  const tokens = tokenize(trimmed);
+  const [bin, ...args] = tokens;
+
+  if (!bin || !ALLOWED_BASE_COMMANDS.has(bin)) {
+    return { ok: false, reason: `Command not allowed: "${bin || trimmed}"` };
   }
 
-  // For piped commands, check each segment's base command
-  // Split on |, ; and && to check each part
-  const segments = trimmed.split(/\s*([|;]|&&|\|\|)\s*/).map((s) => s.trim()).filter((s) => s && !['|', ';', '&&', '||'].includes(s));
-  
-  for (const segment of segments) {
-    const baseCmd = segment.split(/\s+/)[0].replace(/^[!]/, ''); // Remove ! prefix
-    if (!ALLOWED_BASE_COMMANDS.has(baseCmd)) {
-      return false;
+  for (const arg of args) {
+    if (BLOCKED_ARGS.some((pattern) => pattern.test(arg))) {
+      return { ok: false, reason: `Blocked argument: ${arg}` };
+    }
+
+    const resolvedPath = resolveIfPath(arg);
+    if (resolvedPath && !isAllowedPath(resolvedPath)) {
+      return { ok: false, reason: `Path not allowed: ${arg}` };
     }
   }
 
-  return segments.length > 0;
+  return { ok: true, bin, args };
 }
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const command = (body.command || '').trim();
+    const command = String(body.command || '');
+    const validated = validateCommand(command);
 
-    if (!command) {
-      return NextResponse.json({ error: 'No command provided' }, { status: 400 });
-    }
-
-    if (!isCommandAllowed(command)) {
-      return NextResponse.json({
-        error: `Command not allowed: "${command}"`,
-        hint: 'Only safe read-only commands are permitted (ls, cat, df, ps, git, ping, etc.). Commands like env, curl, wget, node, python are blocked for security.',
-      }, { status: 403 });
+    if (!validated.ok) {
+      return NextResponse.json(
+        {
+          error: validated.reason,
+          hint: 'The terminal only allows single safe commands without shell features, network fetches, or paths outside approved diagnostic locations.',
+        },
+        { status: 403 }
+      );
     }
 
     const start = Date.now();
-    const { stdout, stderr } = await execAsync(command, { timeout: 10000, maxBuffer: 1024 * 1024 });
+    const { stdout, stderr } = await execFileAsync(validated.bin, validated.args, {
+      timeout: 10000,
+      maxBuffer: 1024 * 1024,
+      shell: false,
+      cwd: OPENCLAW_WORKSPACE,
+      env: {
+        ...process.env,
+        PATH: process.env.PATH || '/usr/bin:/bin',
+        HOME: process.env.HOME || '/tmp',
+        LANG: process.env.LANG || 'C.UTF-8',
+      },
+    });
     const duration = Date.now() - start;
 
     return NextResponse.json({
       output: stdout + (stderr ? `\nSTDERR: ${stderr}` : ''),
       duration,
-      command,
+      command: `${validated.bin}${validated.args.length ? ` ${validated.args.join(' ')}` : ''}`,
     });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    return NextResponse.json({ error: msg, output: msg }, { status: 200 }); // Return 200 with error in output
+    return NextResponse.json({ error: msg, output: msg }, { status: 200 });
   }
 }

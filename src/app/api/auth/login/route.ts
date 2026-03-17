@@ -1,5 +1,11 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
+import {
+  authCookieName,
+  createSessionToken,
+  sessionTtlSeconds,
+  verifyPassword,
+} from "@/lib/auth";
 
 // Simple in-memory rate limiter (per-IP, resets on server restart)
 // Sufficient for a personal dashboard — no external dependency needed
@@ -87,22 +93,27 @@ export async function POST(request: NextRequest) {
 
   const { password } = await request.json();
 
-  if (password === process.env.ADMIN_PASSWORD) {
-    clearAttempts(ip); // Reset on success
+  try {
+    if (typeof password === "string" && (await verifyPassword(password))) {
+      clearAttempts(ip); // Reset on success
 
-    const response = NextResponse.json({ success: true });
+      const response = NextResponse.json({ success: true });
 
-    // Set auth cookie (7 days expiry)
-    // secure=true in production (HTTPS), false in dev (HTTP localhost)
-    response.cookies.set("mc_auth", process.env.AUTH_SECRET!, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
-      maxAge: 60 * 60 * 24 * 7, // 7 days
-      path: "/",
-    });
+      response.cookies.set(authCookieName, await createSessionToken(), {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "strict",
+        maxAge: sessionTtlSeconds,
+        path: "/",
+      });
 
-    return response;
+      return response;
+    }
+  } catch {
+    return NextResponse.json(
+      { success: false, error: "Server auth configuration is invalid" },
+      { status: 500 }
+    );
   }
 
   // Record failed attempt

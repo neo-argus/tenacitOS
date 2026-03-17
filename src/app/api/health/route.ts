@@ -1,19 +1,19 @@
 /**
  * Health check endpoint
- * GET /api/health - Check health of all services and integrations
+ * GET /api/health - minimal public liveness, detailed checks only for authenticated users
  */
-import { NextResponse } from 'next/server';
-import { exec } from 'child_process';
+import { NextRequest, NextResponse } from 'next/server';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { isAuthenticatedRequest } from '@/lib/auth';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 interface ServiceCheck {
   name: string;
   status: 'up' | 'down' | 'degraded' | 'unknown';
   latency?: number;
   details?: string;
-  url?: string;
 }
 
 async function checkUrl(url: string, timeoutMs = 5000): Promise<{ status: 'up' | 'down'; latency: number; httpCode?: number }> {
@@ -21,7 +21,7 @@ async function checkUrl(url: string, timeoutMs = 5000): Promise<{ status: 'up' |
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await fetch(url, { signal: controller.signal, cache: 'no-store' });
     clearTimeout(timeout);
     const latency = Date.now() - start;
     return { status: res.ok || res.status < 500 ? 'up' : 'down', latency, httpCode: res.status };
@@ -32,31 +32,40 @@ async function checkUrl(url: string, timeoutMs = 5000): Promise<{ status: 'up' |
 
 async function checkSystemdService(name: string): Promise<ServiceCheck> {
   try {
-    const { stdout } = await execAsync(`systemctl is-active ${name} 2>/dev/null`);
+    const { stdout } = await execFileAsync('systemctl', ['is-active', name], { timeout: 4000 });
     const active = stdout.trim() === 'active';
-    return { name, status: active ? 'up' : 'down', details: stdout.trim() };
+    return { name, status: active ? 'up' : 'down' };
   } catch {
-    return { name, status: 'down', details: 'service not found' };
+    return { name, status: 'down' };
   }
 }
 
 async function checkPm2Service(name: string): Promise<ServiceCheck> {
   try {
-    const { stdout } = await execAsync('pm2 jlist 2>/dev/null');
+    const { stdout } = await execFileAsync('pm2', ['jlist'], { timeout: 5000, maxBuffer: 1024 * 1024 });
     const list = JSON.parse(stdout);
     const proc = list.find((p: { name: string }) => p.name === name);
-    if (!proc) return { name, status: 'unknown', details: 'not found in pm2' };
+    if (!proc) return { name, status: 'unknown' };
     const status = proc.pm2_env?.status === 'online' ? 'up' : 'down';
-    return { name, status, details: `${proc.pm2_env?.status} · restarts: ${proc.pm2_env?.restart_time}` };
+    return { name, status };
   } catch {
-    return { name, status: 'unknown', details: 'pm2 not available' };
+    return { name, status: 'unknown' };
   }
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+  const timestamp = new Date().toISOString();
+
+  if (!(await isAuthenticatedRequest(request))) {
+    return NextResponse.json({
+      status: 'ok',
+      scope: 'public',
+      timestamp,
+    });
+  }
+
   const checks: ServiceCheck[] = [];
 
-  // Internal services
   const [missionControl, gateway] = await Promise.all([
     checkSystemdService('mission-control'),
     checkSystemdService('openclaw-gateway'),
@@ -64,40 +73,26 @@ export async function GET() {
   checks.push({ ...missionControl, name: 'Mission Control' });
   checks.push({ ...gateway, name: 'OpenClaw Gateway' });
 
-  // PM2 services
   const pm2Services = ['classvault', 'content-vault', 'brain'];
   const pm2Checks = await Promise.all(pm2Services.map(checkPm2Service));
   checks.push(...pm2Checks);
 
-  // External URLs
-  const urlChecks = await Promise.all([
-    checkUrl('https://tenacitas.cazaustre.dev'),
-    checkUrl('https://api.anthropic.com', 3000),
-  ]);
-
-  checks.push({
-    name: 'tenacitas.cazaustre.dev',
-    status: urlChecks[0].status,
-    latency: urlChecks[0].latency,
-    url: 'https://tenacitas.cazaustre.dev',
-  });
-
+  const anthropic = await checkUrl('https://api.anthropic.com', 3000);
   checks.push({
     name: 'Anthropic API',
-    status: urlChecks[1].status === 'up' || (urlChecks[1] as { httpCode?: number }).httpCode === 401 ? 'up' : urlChecks[1].status,
-    latency: urlChecks[1].latency,
-    url: 'https://api.anthropic.com',
-    details: urlChecks[1].status === 'up' || (urlChecks[1] as { httpCode?: number }).httpCode === 401 ? 'reachable' : 'unreachable',
+    status: anthropic.status === 'up' || anthropic.httpCode === 401 ? 'up' : anthropic.status,
+    latency: anthropic.latency,
+    details: anthropic.status === 'up' || anthropic.httpCode === 401 ? 'reachable' : 'unreachable',
   });
 
-  // Overall status
   const downCount = checks.filter((c) => c.status === 'down').length;
   const overallStatus = downCount === 0 ? 'healthy' : downCount < checks.length / 2 ? 'degraded' : 'critical';
 
   return NextResponse.json({
     status: overallStatus,
+    scope: 'authenticated',
     checks,
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
+    timestamp,
+    uptime: Math.floor(process.uptime()),
   });
 }

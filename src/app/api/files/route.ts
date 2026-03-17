@@ -3,6 +3,10 @@ import { promises as fs } from "fs";
 import path from "path";
 
 const OPENCLAW_DIR = process.env.OPENCLAW_DIR || "/root/.openclaw";
+const WORKSPACE_MAP: Record<string, string> = {
+  workspace: path.join(OPENCLAW_DIR, "workspace"),
+  "mission-control": path.join(OPENCLAW_DIR, "workspace", "mission-control"),
+};
 
 // Files to show in the memory browser
 const ROOT_FILES = ["MEMORY.md", "SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md", "IDENTITY.md"];
@@ -100,9 +104,14 @@ export async function GET(request: NextRequest) {
   const filePath = searchParams.get("path");
 
   try {
-    // Determine workspace path
-    const workspacePath = path.join(OPENCLAW_DIR, workspace);
-    
+    const workspacePath = WORKSPACE_MAP[workspace];
+    if (!workspacePath) {
+      return NextResponse.json(
+        { error: "Unknown workspace" },
+        { status: 400 }
+      );
+    }
+
     // Validate workspace exists
     if (!(await fileExists(workspacePath))) {
       return NextResponse.json(
@@ -165,8 +174,14 @@ export async function PUT(request: NextRequest) {
       );
     }
 
-    const workspacePath = path.join(OPENCLAW_DIR, workspace);
-    
+    const workspacePath = WORKSPACE_MAP[workspace];
+    if (!workspacePath) {
+      return NextResponse.json(
+        { error: "Unknown workspace" },
+        { status: 400 }
+      );
+    }
+
     // Validate workspace exists
     if (!(await fileExists(workspacePath))) {
       return NextResponse.json(

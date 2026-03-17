@@ -3,6 +3,10 @@ import { promises as fs } from "fs";
 import path from "path";
 
 const OPENCLAW_DIR = process.env.OPENCLAW_DIR || "/root/.openclaw";
+const WORKSPACE_MAP: Record<string, string> = {
+  workspace: path.join(OPENCLAW_DIR, "workspace"),
+  "mission-control": path.join(OPENCLAW_DIR, "workspace", "mission-control"),
+};
 
 interface FileEntry {
   name: string;
@@ -19,9 +23,14 @@ export async function GET(request: NextRequest) {
     const fileContent = searchParams.get("content") === "true";
     const rawMode = searchParams.get("raw") === "true";
     
-    // Determine BASE_PATH based on workspace
-    const BASE_PATH = path.join(OPENCLAW_DIR, workspace);
-    
+    const BASE_PATH = WORKSPACE_MAP[workspace];
+    if (!BASE_PATH) {
+      return NextResponse.json(
+        { error: "Unknown workspace" },
+        { status: 400 }
+      );
+    }
+
     // Validate workspace exists
     try {
       await fs.access(BASE_PATH);
